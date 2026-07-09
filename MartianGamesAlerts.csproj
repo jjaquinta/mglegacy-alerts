@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>MartianGamesAlerts</AssemblyName>
+    <RootNamespace>MartianGamesAlerts</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>App.ico</ApplicationIcon>
+
+    <!-- Publish-time size reductions. These only affect `dotnet publish`,
+         so `dotnet run` / `dotnet build` stay fast.
+           EnableCompressionInSingleFile: ~115 MB -> ~55 MB
+           DebugType=embedded:            no separate .pdb in publish output
+           DebuggerSupport=false:         removes debug-only code paths
+           EventSourceSupport=false:      removes ETW eventing
+           UseSystemResourceKeys=true:    English-only error messages
+    -->
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>embedded</DebugType>
+    <DebuggerSupport>false</DebuggerSupport>
+    <EventSourceSupport>false</EventSourceSupport>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- LogicalName lets us load with GetManifestResourceStream("App.ico")
+         instead of needing the namespace prefix. -->
+    <EmbeddedResource Include="App.ico">
+      <LogicalName>App.ico</LogicalName>
+    </EmbeddedResource>
+    <Using Include="System.IO" />
+  </ItemGroup>
+
+</Project>
