@@ -100,7 +100,13 @@ internal sealed class Installer
         string url, string destPath, long expectedSize,
         IProgress<InstallProgress> progress, CancellationToken ct)
     {
-        using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
+        using var http = new HttpClient(new HttpClientHandler
+        {
+            // Match SelfUpdater — handle any Content-Encoding the server
+            // might send transparently.
+            AutomaticDecompression = System.Net.DecompressionMethods.All,
+        })
+        { Timeout = TimeSpan.FromMinutes(30) };
         using var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
 
@@ -193,10 +199,13 @@ internal sealed class Installer
         fileName.Equals("Uninstall.exe",         StringComparison.OrdinalIgnoreCase) ||
         fileName.Equals("UnityPlayer.exe",       StringComparison.OrdinalIgnoreCase);
 
-    // Directory.Delete + recursive fails hard on the first sharing violation
-    // or read-only file. This helper clears read-only attributes on the way
-    // in, then retries with exponential backoff to ride out transient locks
-    // (typically Windows Defender scanning a freshly-extracted tree).
+    // Prepares installPath for a fresh extract. Tries delete-with-retry
+    // first; if that fails, tries renaming the directory out of the way
+    // (Move often works when Delete doesn't, because it only touches the
+    // parent's directory entry rather than child file handles). If both
+    // fail, throws with a diagnostic listing the specific files we can't
+    // get an exclusive handle on — usually the game's own exe, meaning
+    // it's currently running.
     private static async Task DeleteDirectoryRobustAsync(string path, CancellationToken ct)
     {
         if (!Directory.Exists(path)) return;
@@ -210,13 +219,10 @@ internal sealed class Installer
                     File.SetAttributes(file, attrs & ~FileAttributes.ReadOnly);
             }
         }
-        catch
-        {
-            // Best-effort — if we can't enumerate/adjust attributes, the
-            // Delete attempts below will surface the real problem.
-        }
+        catch { /* best effort */ }
 
-        const int maxAttempts = 6;
+        // Attempt 1: direct delete with exponential backoff.
+        const int maxAttempts = 4;
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
@@ -228,9 +234,54 @@ internal sealed class Installer
                 (ex is IOException || ex is UnauthorizedAccessException)
                 && attempt < maxAttempts)
             {
-                // 250, 500, 1000, 2000, 4000 ms — total ~7.75s worst case.
-                await Task.Delay(250 * (1 << (attempt - 1)), ct);
+                await Task.Delay(500 * attempt, ct);
             }
         }
+
+        // Attempt 2: rename out of the way. Leaves a *.old-YYYYMMDDHHMMSS
+        // sibling directory behind, cleanable later.
+        var sidelined = path + ".old-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+        try
+        {
+            Directory.Move(path, sidelined);
+            return;
+        }
+        catch (Exception moveEx)
+        {
+            var locked = FindLikelyLockedFiles(path);
+            var detail = locked.Count > 0
+                ? "Locked files (may indicate the game is running):\n  "
+                    + string.Join("\n  ", locked.Take(5).Select(f => Path.GetFileName(f)))
+                    + (locked.Count > 5 ? $"\n  … and {locked.Count - 5} more" : "")
+                    + "\n\nClose the game and any File Explorer windows on this folder, then retry."
+                : "Close the game if it's running and any File Explorer window on this folder, then retry."
+                    + $"\n\nUnderlying error: {moveEx.Message}";
+
+            throw new IOException(
+                $"Can't clean up existing install at:\n{path}\n\n{detail}");
+        }
+    }
+
+    // Best-effort test: try opening each file for exclusive write access.
+    // Anything that fails is currently held by another process or by us.
+    private static List<string> FindLikelyLockedFiles(string root)
+    {
+        var locked = new List<string>();
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    using var _ = File.Open(file, FileMode.Open, FileAccess.Write, FileShare.None);
+                }
+                catch
+                {
+                    locked.Add(file);
+                }
+            }
+        }
+        catch { /* enumeration itself may fail; return what we have */ }
+        return locked;
     }
 }

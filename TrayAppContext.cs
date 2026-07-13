@@ -19,20 +19,39 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly SynchronizationContext _uiSync;
     private LauncherWindow? _launcherWindow;
 
+    // Tracks the intent of the most recent balloon so a click can be
+    // routed to the right action. Reset to None after each click.
+    private enum BalloonKind { None, Update, Info }
+    private BalloonKind _lastBalloonKind = BalloonKind.None;
+
     public TrayAppContext(Settings settings)
     {
+        UpdateLog.Line("STARTUP", "TrayAppContext ctor: enter");
         _settings = settings;
         _uiSync = SynchronizationContext.Current ?? new SynchronizationContext();
 
+        Icon icon;
+        try
+        {
+            icon = LoadAppIcon();
+            UpdateLog.Line("STARTUP", "TrayAppContext ctor: icon loaded");
+        }
+        catch (Exception ex)
+        {
+            UpdateLog.Line("STARTUP", $"TrayAppContext ctor: icon load threw ({ex.GetType().Name}: {ex.Message}); using SystemIcons.Information");
+            icon = SystemIcons.Information;
+        }
+
         _icon = new NotifyIcon
         {
-            Icon = LoadAppIcon(),
+            Icon = icon,
             Visible = true,
             Text = "Martian Games Alerts",
             ContextMenuStrip = BuildMenu(),
         };
+        UpdateLog.Line("STARTUP", "TrayAppContext ctor: NotifyIcon constructed and visible");
 
-        _icon.BalloonTipClicked += (_, _) => OpenPortal();
+        _icon.BalloonTipClicked += OnBalloonTipClicked;
         _icon.DoubleClick      += (_, _) => ShowLauncher();
 
         _worker = new PollWorker(
@@ -41,8 +60,20 @@ internal sealed class TrayAppContext : ApplicationContext
             onSummary: OnSummaryFromWorker,
             onTooltip: OnTooltipFromWorker);
         _worker.Start();
+        UpdateLog.Line("STARTUP", "TrayAppContext ctor: PollWorker started");
 
-        _ = Task.Run(() => UpdateChecker.CheckAsync(_settings.ManifestUrl));
+        // Fire-and-forget: log manifest contents AND check whether we
+        // should prompt the user to self-update.
+        _ = Task.Run(async () =>
+        {
+            await UpdateChecker.CheckAsync(_settings.ManifestUrl);
+            var status = await SelfUpdater.CheckForUpdateAsync(_settings.ManifestUrl);
+            if (status == UpdateStatus.UpdateAvailable)
+            {
+                _uiSync.Post(_ => ShowUpdateAvailableBalloon(), null);
+            }
+        });
+        UpdateLog.Line("STARTUP", "TrayAppContext ctor: exit");
     }
 
     private static Icon LoadAppIcon()
@@ -57,8 +88,7 @@ internal sealed class TrayAppContext : ApplicationContext
         menu.Items.Add("Show launcher…",        null, (_, _) => ShowLauncher());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Check now",             null, (_, _) => _worker.TriggerCheck(showSummary: true));
-        menu.Items.Add("Check for updates",     null,
-            (_, _) => _ = Task.Run(() => UpdateChecker.CheckAsync(_settings.ManifestUrl)));
+        menu.Items.Add("Check for updates",     null, (_, _) => CheckForUpdatesAndPrompt());
         menu.Items.Add("Settings…",             null, (_, _) => ShowSettings());
         menu.Items.Add("Open portal",           null, (_, _) => OpenPortal());
         menu.Items.Add("Open settings folder",  null, (_, _) => OpenSettingsFolder());
@@ -81,6 +111,92 @@ internal sealed class TrayAppContext : ApplicationContext
         _launcherWindow = new LauncherWindow(_settings);
         _launcherWindow.Closed += (_, _) => _launcherWindow = null;
         _launcherWindow.Show();
+    }
+
+    // ---- Self-update UI ----
+
+    private void CheckForUpdatesAndPrompt()
+    {
+        _ = Task.Run(async () =>
+        {
+            var status = await SelfUpdater.CheckForUpdateAsync(_settings.ManifestUrl);
+            _uiSync.Post(_ =>
+            {
+                switch (status)
+                {
+                    case UpdateStatus.UpdateAvailable:
+                        ShowUpdateAvailableBalloon();
+                        break;
+                    case UpdateStatus.UpToDate:
+                        ShowInfoBalloon("Up to date",
+                            "You have the latest version.");
+                        break;
+                    case UpdateStatus.NotApplicable:
+                        ShowInfoBalloon("Development build",
+                            "Self-update is disabled for local builds.");
+                        break;
+                    case UpdateStatus.CannotDetermine:
+                        ShowInfoBalloon("Update check failed",
+                            "Couldn't check for updates. Try again later.");
+                        break;
+                }
+            }, null);
+        });
+    }
+
+    private void ShowUpdateAvailableBalloon()
+    {
+        _lastBalloonKind = BalloonKind.Update;
+        _icon.BalloonTipTitle = "Update available";
+        _icon.BalloonTipText  = "A new version is ready. Click here to install.";
+        _icon.BalloonTipIcon  = ToolTipIcon.Info;
+        _icon.ShowBalloonTip(15_000);
+    }
+
+    private void ShowInfoBalloon(string title, string text)
+    {
+        _lastBalloonKind = BalloonKind.Info;
+        _icon.BalloonTipTitle = title;
+        _icon.BalloonTipText  = text;
+        _icon.BalloonTipIcon  = ToolTipIcon.Info;
+        _icon.ShowBalloonTip(5_000);
+    }
+
+    private void OnBalloonTipClicked(object? sender, EventArgs e)
+    {
+        var kind = _lastBalloonKind;
+        _lastBalloonKind = BalloonKind.None;
+        switch (kind)
+        {
+            case BalloonKind.Update:
+                _ = TriggerSelfUpdateAsync();
+                break;
+            default:
+                // Player-activity balloon or an Info balloon — legacy
+                // behavior was to open the portal.
+                OpenPortal();
+                break;
+        }
+    }
+
+    private async Task TriggerSelfUpdateAsync()
+    {
+        try
+        {
+            _icon.Text = "Installing update…";
+            await SelfUpdater.DoInPlaceUpdateAsync(_settings.ManifestUrl);
+            // Success — exit so the newly spawned instance takes over.
+            ExitThread();
+        }
+        catch (Exception ex)
+        {
+            _icon.Text = "Martian Games Alerts";
+            MessageBox.Show(
+                $"Update failed:\n\n{ex.Message}",
+                "Martian Games Alerts",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     private void OnAlertFromWorker(ActiveGame game)
